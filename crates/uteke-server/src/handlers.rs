@@ -37,6 +37,17 @@ pub fn route(uteke: &Mutex<Uteke>, ctx: &ReqCtx, req: &mut Request) -> Response<
     // Handler functions still receive the full `path` with query params intact.
     let route_path = path.split('?').next().unwrap_or(&path);
 
+    // DNS-rebinding guard (#1326): runs before everything else, preflight and
+    // health included, since a rebinding page can hit any route.
+    let host_header = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string());
+    if !ctx.host_guard.allows(host_header.as_deref()) {
+        return ctx.error_response_for(req, 403, "Host not allowed");
+    }
+
     // CORS preflight — no auth required
     if method == Method::Options {
         return Response::new(
@@ -3071,6 +3082,7 @@ mod room_memories_namespace_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -3302,6 +3314,7 @@ mod room_recall_at_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -3505,6 +3518,7 @@ mod room_recall_at_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -3790,6 +3804,7 @@ mod contradiction_api_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -3929,6 +3944,7 @@ mod pack_recall_api_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -4089,6 +4105,7 @@ mod explain_recall_api_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -4215,6 +4232,7 @@ mod list_pagination_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -4318,6 +4336,7 @@ mod payload_conformance_tests {
             cors_origins: vec![],
             recall_config: None,
             extraction_config: None,
+            host_guard: Default::default(),
         };
 
         let remember_body: &'static str = Box::leak(r#"{"content":"Payload conformance probe memory #1233 with distinctive tokens zebraquartz","namespace":"conf"}"#.to_string().into_boxed_str());
@@ -4395,6 +4414,7 @@ mod payload_conformance_tests {
             cors_origins: vec![],
             recall_config: None,
             extraction_config: None,
+            host_guard: Default::default(),
         };
         let mut req = tiny_http::TestRequest::new()
             .with_method(tiny_http::Method::Post)
@@ -4451,6 +4471,7 @@ mod payload_conformance_tests {
                     cors_origins: Vec::new(),
                     recall_config: None,
                     extraction_config: None,
+                    host_guard: Default::default(),
                 };
                 let resp = route(&self.uteke, &ctx, &mut req);
                 let status = resp.status_code().0;
@@ -4558,6 +4579,7 @@ mod routes_introspection_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -4665,6 +4687,7 @@ mod plain_remember_type_tests {
                 cors_origins: Vec::new(),
                 recall_config: None,
                 extraction_config: None,
+                host_guard: Default::default(),
             };
             let resp = route(&self.uteke, &ctx, &mut req);
             let status = resp.status_code().0;
@@ -4773,6 +4796,55 @@ mod plain_remember_type_tests {
 }
 
 #[cfg(test)]
+mod host_guard_route_tests {
+    use super::*;
+    use crate::context::HostGuard;
+    use tiny_http::{Header, TestRequest};
+
+    fn status(guard: HostGuard, host: Option<&str>, path: &str) -> u16 {
+        let uteke = Mutex::new(
+            Uteke::open_with_backend(":memory:", None)
+                .expect("open in-memory uteke without embedder"),
+        );
+        let ctx = ReqCtx {
+            auth_token_hash: None,
+            read_only_token_hash: None,
+            cors_origins: Vec::new(),
+            recall_config: None,
+            extraction_config: None,
+            host_guard: guard,
+        };
+        let mut t = TestRequest::new().with_method(Method::Get).with_path(path);
+        if let Some(h) = host {
+            t = t.with_header(Header::from_bytes(&b"Host"[..], h.as_bytes()).unwrap());
+        }
+        let mut req = t.into();
+        route(&uteke, &ctx, &mut req).status_code().0
+    }
+
+    // #1326 acceptance: a loopback bind rejects `Host: evil.example`.
+    #[test]
+    fn loopback_bind_rejects_foreign_host() {
+        let g = HostGuard::new("127.0.0.1", &[]);
+        assert_eq!(status(g.clone(), Some("evil.example:8767"), "/health"), 403);
+        assert_eq!(status(g.clone(), Some("evil.example"), "/stats"), 403);
+        assert_eq!(status(g.clone(), Some("127.0.0.1:8767"), "/health"), 200);
+        assert_eq!(status(g, Some("localhost:8767"), "/health"), 200);
+    }
+
+    // #1326 acceptance: a Docker-style bind works, and allowed_hosts is honoured.
+    #[test]
+    fn docker_style_bind_and_allowed_hosts() {
+        let open = HostGuard::new("0.0.0.0", &[]);
+        assert_eq!(status(open, Some("uteke:8767"), "/health"), 200);
+
+        let listed = HostGuard::new("0.0.0.0", &["uteke".to_string()]);
+        assert_eq!(status(listed.clone(), Some("uteke:8767"), "/health"), 200);
+        assert_eq!(status(listed, Some("evil.example"), "/health"), 403);
+    }
+}
+
+#[cfg(test)]
 mod mcp_http_hardening_tests {
     use super::*;
     use tiny_http::{Header, TestRequest};
@@ -4791,6 +4863,7 @@ mod mcp_http_hardening_tests {
             cors_origins: origins,
             recall_config: None,
             extraction_config: None,
+            host_guard: Default::default(),
         }
     }
 
