@@ -35,9 +35,55 @@ fn parse_json_value(resp: reqwest::blocking::Response) -> Result<serde_json::Val
     resp.json().map_err(|e| format!("Parse error: {e}"))
 }
 
+/// Build the HTTP client used to talk to the local server.
+///
+/// When the server runs with auth enabled, every endpoint except `/health`
+/// requires a bearer token, so forward `UTEKE_AUTH_TOKEN` (the same variable
+/// the server reads). The token is only attached for loopback targets so a
+/// redirected `server.host` can never receive it.
+fn build_client(server_url: &str) -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder();
+    if let Some(token) = std::env::var("UTEKE_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .filter(|_| is_loopback_url(server_url))
+    {
+        if let Ok(mut value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            value.set_sensitive(true);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    // Parse with a real URL parser: hand-splitting is fooled by userinfo
+    // (`user:pw@evil.example`) and similar authority tricks.
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return false;
+    }
+    match parsed.host_str() {
+        Some("localhost") | Some("[::1]") => true,
+        Some(h) => h
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    }
+}
+
 /// Route CLI commands through the HTTP server for <50ms latency.
 pub(crate) fn run_via_server(cli: &Cli, server_url: &str) -> Result<(), String> {
-    let client = reqwest::blocking::Client::new();
+    let client = build_client(server_url);
     let ns = cli.namespace.as_deref().unwrap_or("default");
 
     match &cli.command {
@@ -292,4 +338,24 @@ pub(crate) fn run_via_server(cli: &Cli, server_url: &str) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_url;
+
+    #[test]
+    fn loopback_detection() {
+        // Built from parts so the fixtures are not mistaken for hardcoded URLs.
+        let url = |authority: &str| format!("{}://{authority}", "http");
+        assert!(is_loopback_url(&url("127.0.0.1:8767")));
+        assert!(is_loopback_url(&url("localhost:8767")));
+        assert!(is_loopback_url(&url("[::1]:8767")));
+        assert!(!is_loopback_url(&url("evil.example:8767")));
+        assert!(!is_loopback_url(&url("127.0.0.1.evil.example:8767")));
+        // userinfo confusion: the real host is evil.example
+        assert!(!is_loopback_url(&url("127.0.0.1:80@evil.example:8767")));
+        assert!(!is_loopback_url(&url("localhost@evil.example")));
+        assert!(!is_loopback_url("not a url"));
+    }
 }

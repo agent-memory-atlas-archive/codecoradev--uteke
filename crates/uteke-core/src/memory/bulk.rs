@@ -212,25 +212,18 @@ impl super::Store {
             return Ok(0);
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let placeholders: String = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 3))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "UPDATE memories SET deprecated = 1, valid_until = ?1, deprecate_reason = ?2, updated_at = ?1, deprecated_at = ?1 WHERE id IN ({placeholders}) AND deprecated = 0"
-        );
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(now), Box::new(reason.to_string())];
-        for id in ids {
-            params_vec.push(Box::new(id.clone()));
-        }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+        // Ids are passed as ONE JSON-array parameter and expanded with
+        // json_each(): no dynamic SQL and no bound-parameter limit.
+        let ids_json =
+            serde_json::to_string(ids).map_err(|e| Error::db("database operation", e))?;
         let count = self
             .conn
-            .execute(&sql, rusqlite::params_from_iter(param_refs))
+            .execute(
+                "UPDATE memories SET deprecated = 1, valid_until = ?1, deprecate_reason = ?2, \
+                 updated_at = ?1, deprecated_at = ?1 \
+                 WHERE id IN (SELECT value FROM json_each(?3)) AND deprecated = 0",
+                params![now, reason, ids_json],
+            )
             .map_err(|e| Error::db("database operation", e))?;
         Ok(count)
     }
@@ -323,23 +316,16 @@ impl super::Store {
         if ids.is_empty() {
             return Ok(0);
         }
-        // Build parameterized IN clause: "WHERE id IN (?1, ?2, ?3)"
-        let placeholders: String = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!("DELETE FROM memories WHERE id IN ({placeholders})");
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
-            .iter()
-            .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
+        // Single statement (atomic) with the ids as one JSON-array parameter:
+        // no dynamic SQL and no bound-parameter limit.
+        let ids_json =
+            serde_json::to_string(ids).map_err(|e| Error::db("database operation", e))?;
         let deleted = self
             .conn
-            .execute(&sql, rusqlite::params_from_iter(param_refs))
+            .execute(
+                "DELETE FROM memories WHERE id IN (SELECT value FROM json_each(?1))",
+                params![ids_json],
+            )
             .map_err(|e| Error::db("database operation", e))?;
         Ok(deleted)
     }
